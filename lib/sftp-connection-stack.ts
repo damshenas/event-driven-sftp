@@ -1,27 +1,21 @@
-
-import {
-    RemovalPolicy,
-    SecretValue,
-    Stack,
+import { Construct } from 'constructs';
+import { RemovalPolicy, Stack, StackProps,
     aws_transfer as transfer,
     aws_s3 as s3,
-    aws_iam as iam,
-    aws_logs as logs,
-    aws_cloudwatch as cw,
+    aws_iam as iam
 } from 'aws-cdk-lib';
-import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
-import { Construct } from 'constructs';
-import { SFTPServerStackProps } from './sftp-server-stack';
 
 /** Additional properties we like to add */
-export interface SFTPConnectionStackProps extends SFTPServerStackProps {
-    // To include the credentials in Secret Manager
-    privateKey: string
-    serverId: string,
-    logingRole: string
+export interface SFTPConnectionStackProps extends StackProps {
+    sftpServerId: string,
+    logingRoleArn: string,
+    stageName: string
 }
 
 export class SFTPConnectionStack extends Stack {
+
+    public readonly SftpConnector: transfer.CfnConnector;
+
     constructor(scope: Construct, id: string, props: SFTPConnectionStackProps) {
         super(scope, id, props);
 
@@ -33,16 +27,6 @@ export class SFTPConnectionStack extends Stack {
             // Do not use for production!
             removalPolicy: RemovalPolicy.DESTROY,
         });
-        
-        const secretManager = new Secret(scope, 'TransferSFTPSecret', {
-            secretName: 'TransferSFTPSecret',
-            secretObjectValue: {
-                username: SecretValue.unsafePlainText('user1'),
-                publicKey: SecretValue.unsafePlainText(props.publicKey),
-                privateKey: SecretValue.unsafePlainText(props.privateKey)
-            },
-            removalPolicy: RemovalPolicy.DESTROY
-        })
 
         // Allow SFTP user to write the S3 bucket and read secret
         const sftpConnectionAccessPolicy = new iam.ManagedPolicy(this, 'SFTPConnectionAccessPolicy', {
@@ -51,7 +35,6 @@ export class SFTPConnectionStack extends Stack {
         });
 
         sftpConnectorBucket.grantReadWrite(sftpConnectionAccessPolicy);
-        secretManager.grantRead(sftpConnectionAccessPolicy)
 
         const sftpConnectionAccessRole = new iam.Role(this, 'SFTPConnectionAccessRole', {
             assumedBy: new iam.ServicePrincipal('transfer.amazonaws.com'),
@@ -61,14 +44,21 @@ export class SFTPConnectionStack extends Stack {
             ]
         });
 
-        const sftpConnector = new transfer.CfnConnector(scope, 'TransferSFTPConnector', {
-            accessRole: sftpConnectionAccessRole.roleArn,
-            loggingRole: props.logingRole,
-            url: `sftp://${props.serverId}.server.transfer.${this.region}.amazonaws.com`,
-            sftpConfig: {
-                trustedHostKeys: [props.publicKey],
-                userSecretId: secretManager.secretArn
+        sftpConnectionAccessRole.addToPolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            resources: [`arn:aws:secretsmanager:${props.env?.region}:${props.env?.account}:secret:${props.stageName}/SFTPSecrets/*`],
+            actions: ["secretsmanager:GetSecretValue"],
+            conditions: {
+                StringEquals: { //"ForAnyValue:StringEquals"
+                    "aws:CalledVia": ["lambda.amazonaws.com"]
+                }
             }
+        }));
+
+        this.SftpConnector = new transfer.CfnConnector(scope, 'TransferSFTPConnector', {
+            accessRole: sftpConnectionAccessRole.roleArn,
+            loggingRole: props.logingRoleArn,
+            url: `sftp://${props.sftpServerId}.server.transfer.${this.region}.amazonaws.com`,
         })
     }
 }

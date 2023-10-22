@@ -1,5 +1,5 @@
-import {
-    Stack, StackProps, RemovalPolicy, CfnOutput,
+import { Construct } from 'constructs';
+import { Stack, StackProps, RemovalPolicy, CfnOutput,
     aws_s3 as s3,
     aws_ec2 as ec2,
     aws_iam as iam,
@@ -7,33 +7,24 @@ import {
     aws_cloudwatch as cw,
     aws_transfer as transfer,
 } from 'aws-cdk-lib';
-import { Construct } from 'constructs';
-
-/** Additional properties we like to add */
-export interface SFTPServerStackProps extends StackProps {
-    // To include for SFTP user
-    userName: string,
-    publicKey: string
-}
 
 /** Stack for initializing a fully working SFTP server. */
 export class SFTPServerStack extends Stack {
 
-    /** CloudWatch alarm that is triggered if there are too many errors in the logs. */
-    // errorAlarm: cw.Alarm;
-    public readonly server: transfer.CfnServer;
-    public readonly cwLogingRole: iam.Role;
+    public readonly cloudwatchRole: iam.Role;
+    public readonly SftpServer: transfer.CfnServer;
+    public readonly SftpBucket: s3.Bucket;
+    public readonly SftpUserAccessRole: iam.Role;
 
-    constructor(scope: Construct, id: string, props: SFTPServerStackProps) {
+    constructor(scope: Construct, id: string, props: StackProps) {
         super(scope, id, props);
 
-        const sftpServerBucket = new s3.Bucket(this, 'SFTPServerBucket', {
+        this.SftpBucket = new s3.Bucket(this, 'SFTPServerBucket', {
             blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-            bucketName: `sftp-server-data-bucket-${props.env?.account}-${props.env?.region}`,
+            bucketName: `sftp-server-data-bucket-${props.env?.region}`,
             encryption: s3.BucketEncryption.KMS_MANAGED,
             enforceSSL: true,
-            // Do not use for production!
-            removalPolicy: RemovalPolicy.DESTROY,
+            removalPolicy: RemovalPolicy.DESTROY, // Do not use for production!
         });
 
         const vpc = new ec2.Vpc(this, 'VPC', {
@@ -43,7 +34,7 @@ export class SFTPServerStack extends Stack {
 
         // Create the required IAM role which allows the SFTP server
         // to log to CloudWatch.
-        this.cwLogingRole = new iam.Role(this, 'CloudWatchLoggingRole', {
+        this.cloudwatchRole = new iam.Role(this, 'CloudWatchLoggingRole', {
             assumedBy: new iam.ServicePrincipal('transfer.amazonaws.com'),
             description: 'IAM role used by AWS Transfer for logging',
             inlinePolicies: {
@@ -78,7 +69,7 @@ export class SFTPServerStack extends Stack {
             domain: 'vpc',
         }));
 
-        this.server = new transfer.CfnServer(this, 'SFTPServer', {
+        this.SftpServer = new transfer.CfnServer(this, 'SFTPServer', {
             endpointDetails: {
                 securityGroupIds: [sg.securityGroupId],
                 vpcId: vpc.vpcId,
@@ -87,22 +78,15 @@ export class SFTPServerStack extends Stack {
             },
             identityProviderType: 'SERVICE_MANAGED',
             endpointType: 'VPC',
-            loggingRole: this.cwLogingRole.roleArn,
+            loggingRole: this.cloudwatchRole.roleArn,
             protocols: ['SFTP'],
             domain: 'S3',
         });
 
-        // ATTENTION!
-        // Need to add the host key (public key) to the server
-        // But this is currently not implemented in cloudformation and CDK
-        // Can be done manually in the console or via CLI
-        // https://awscli.amazonaws.com/v2/documentation/api/latest/reference/transfer/import-host-key.html
-        // https://docs.aws.amazon.com/transfer/latest/userguide/API_ImportHostKey.html
-
         // Output Server Endpoint access where clients can connect
         new CfnOutput(this, 'SFTPServerEndpoint', {
             description: 'Server Endpoint',
-            value: `${this.server.attrServerId}.server.transfer.${this.region}.amazonaws.com`,
+            value: `${this.SftpServer.attrServerId}.server.transfer.${this.region}.amazonaws.com`,
         });
 
         // Allow SFTP user to write the S3 bucket
@@ -110,9 +94,9 @@ export class SFTPServerStack extends Stack {
             managedPolicyName: 'SftpAccessPolicy',
             description: 'SFTP access policy',
         });
-        sftpServerBucket.grantReadWrite(sftpAccessPolicy);
+        this.SftpBucket.grantReadWrite(sftpAccessPolicy);
 
-        const sftpUserAccessRole = new iam.Role(this, 'SFTPAccessRole', {
+        this.SftpUserAccessRole = new iam.Role(this, 'SFTPAccessRole', {
             assumedBy: new iam.ServicePrincipal('transfer.amazonaws.com'),
             roleName: 'SftpAccessRole',
             managedPolicies: [
@@ -121,20 +105,9 @@ export class SFTPServerStack extends Stack {
         });
 
         const logGroup = new logs.LogGroup(this, 'SFTPLogGroup', {
-            logGroupName: `/aws/transfer/${this.server.attrServerId}`,
+            logGroupName: `/aws/transfer/${this.SftpServer.attrServerId}`,
             removalPolicy: RemovalPolicy.DESTROY,
             retention: logs.RetentionDays.ONE_MONTH,
-        });
-
-        // Configure user which has access to the S3 bucket
-        // https://docs.aws.amazon.com/transfer/latest/userguide/service-managed-users.html
-
-        new transfer.CfnUser(this, 'SFTPUser', {
-            serverId: this.server.attrServerId,
-            homeDirectory: `/${sftpServerBucket.bucketName}/incoming-data`,
-            role: sftpUserAccessRole.roleArn,
-            userName: props.userName,
-            sshPublicKeys: [props.publicKey]
         });
 
         // Metric filter for recognizing two types of errors in the SFTP logs
@@ -147,14 +120,14 @@ export class SFTPServerStack extends Stack {
             unit: cw.Unit.COUNT,
         });
 
-        // // Alarm if there are too many errors
-        // this.errorAlarm = new cw.Alarm(this, 'AlarmMetricFilter', {
-        //     alarmDescription: 'Alarm if there are too many errors in the logs',
-        //     metric: metricFilter.metric(),
-        //     threshold: 1,
-        //     evaluationPeriods: 5,
-        //     datapointsToAlarm: 1,
-        // });
+        // Alarm if there are too many errors
+        new cw.Alarm(this, 'AlarmMetricFilter', {
+            alarmDescription: 'Alarm if there are too many errors in the logs',
+            metric: metricFilter.metric(),
+            threshold: 1,
+            evaluationPeriods: 5,
+            datapointsToAlarm: 1,
+        });
 
         // TODO Add alarm action to notify administrators or perform other actions
     }
